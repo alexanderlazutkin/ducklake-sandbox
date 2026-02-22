@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+
+
+import duckdb  # pip install duckdb
+import yaml    # pip install pyyaml
+
+# --------------------------
+# Config & backend adapters
+# --------------------------
+
+@dataclass
+class MetadataDuckDB:
+    file_path: str
+
+    def attach_sql(self, alias: str, data_path: str) -> str:
+        # ATTACH ducklake with DuckDB metadata file
+        # Example:
+        #   ATTACH 'ducklake:metadata.ducklake' AS alias (DATA_PATH 's3://bucket/prefix/');
+        return f"ATTACH 'ducklake:{self.file_path}' AS {alias} (DATA_PATH '{data_path}');"
+
+
+@dataclass
+class StorageMinIO:
+    bucket: str
+    prefix: str
+    endpoint: str
+    region: str = "eu-central-1"
+    access_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    use_ssl: bool = False
+    url_style: str = "path"
+
+    def data_path(self) -> str:
+        # S3-style path DuckDB understands
+        prefix = self.prefix.strip("/")
+        if prefix:
+            return f"s3://{self.bucket}/{prefix}/"
+        return f"s3://{self.bucket}/"
+
+    def create_secret_sql(self, name: str = "minio") -> str:
+        # We rely on DuckDB's S3 Secret provider. For MinIO we typically set:
+        # ENDPOINT, URL_STYLE, USE_SSL plus creds & region.
+        # You can also omit creds here and rely on env or credential_chain.
+        parts = [
+            "CREATE OR REPLACE SECRET {name} (",
+            "  TYPE S3,",
+        ]
+        if self.access_key and self.secret_key:
+            parts.append(f"  KEY_ID '{self.access_key}',")
+            parts.append(f"  SECRET '{self.secret_key}',")
+        parts.append(f"  ENDPOINT '{self.endpoint.replace('http://','').replace('https://','')}',")
+        parts.append(f"  URL_STYLE '{self.url_style}',")
+        parts.append(f"  USE_SSL {'true' if self.use_ssl else 'false'},")
+        parts.append(f"  REGION '{self.region}'")
+        parts.append(");")
+        sql = "\n".join(parts).format(name=name)
+        return sql
+
+
+@dataclass
+class CatalogConfig:
+    alias: str = "dlsandbox"
+
+
+@dataclass
+class TPCHConfig:
+    default_scale: int = 1
+
+
+@dataclass
+class AppConfig:
+    metadata: MetadataDuckDB
+    storage: StorageMinIO
+    catalog: CatalogConfig
+    tpch: TPCHConfig
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "AppConfig":
+        md = d.get("metadata", {})
+        st = d.get("storage", {})
+        cg = d.get("catalog", {})
+        tp = d.get("tpch", {})
+
+        storage = StorageMinIO(
+            bucket=st.get("bucket", "dlsandbox"),
+            prefix=st.get("prefix", "tpch/"),
+            endpoint=st.get("endpoint", "http://localhost:9000"),
+            region=st.get("region", "eu-central-1"),
+            access_key=st.get("access_key", os.getenv("MINIO_ACCESS_KEY")),
+            secret_key=st.get("secret_key", os.getenv("MINIO_SECRET_KEY") or os.getenv("MINIO_SECRET_ACCESS_KEY")),
+            use_ssl=bool(st.get("use_ssl", False)),
+            url_style=st.get("url_style", "path"),
+        )
+
+        # Validate storage credentials
+        if not storage.access_key:
+            raise ValueError("storage.access_key is required but was not provided in config or environment variables")
+        if not storage.secret_key:
+            raise ValueError("storage.secret_key is required but was not provided in config or environment variables")
+
+        return AppConfig(
+            metadata=MetadataDuckDB(file_path=md.get("duckdb_file", "./metadata.ducklake")),
+            storage=storage,
+            catalog=CatalogConfig(alias=cg.get("alias", "dlsandbox")),
+            tpch=TPCHConfig(default_scale=int(tp.get("default_scale", 1)))
+        )
+
+
+# --------------------------
+# DuckDB helpers
+# --------------------------
+
+def open_duckdb_for_session(cfg: AppConfig) -> duckdb.DuckDBPyConnection:
+    os.makedirs(os.path.dirname(cfg.metadata.file_path) or ".", exist_ok=True)
+    con = duckdb.connect(database=cfg.metadata.file_path)
+
+    # Install/load needed extensions. INSTALL is idempotent.
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute("INSTALL aws; LOAD aws;")
+    con.execute("INSTALL ducklake; LOAD ducklake;")
+    con.execute("INSTALL tpch; LOAD tpch;")
+    return con
+
+
+def reset_metadata_file(cfg: AppConfig) -> None:
+    """
+    Delete the metadata DuckDB file if it exists.
+    This forces a fresh catalog creation on next attach.
+    """
+    if os.path.exists(cfg.metadata.file_path):
+        print(f"[+] Deleting metadata file: {cfg.metadata.file_path}")
+        os.remove(cfg.metadata.file_path)
+        print("[✓] Metadata file deleted.")
+    else:
+        print(f"[skip] Metadata file does not exist: {cfg.metadata.file_path}")
+
+
+def reset_bucket_contents(cfg: AppConfig) -> None:
+    """
+    Delete all objects in the bucket with the configured prefix.
+    This clears the data files from MinIO/S3 storage.
+    """
+    from minio import Minio
+    from minio.error import S3Error
+
+    st = cfg.storage
+    client = Minio(
+        st.endpoint.replace("http://", "").replace("https://", ""),
+        access_key=st.access_key,
+        secret_key=st.secret_key,
+        secure=st.use_ssl,
+    )
+
+    prefix = st.prefix.strip("/")
+    if prefix:
+        prefix = prefix + "/"
+
+    try:
+        if not client.bucket_exists(st.bucket):
+            print(f"[skip] Bucket '{st.bucket}' does not exist.")
+            return
+
+        # List and delete all objects with the prefix
+        objects = list(client.list_objects(st.bucket, prefix=prefix, recursive=True))
+        if not objects:
+            print(f"[skip] No objects found with prefix '{prefix}' in bucket '{st.bucket}'.")
+            return
+
+        print(f"[+] Deleting {len(objects)} objects from bucket '{st.bucket}' with prefix '{prefix}'...")
+        for obj in objects:
+            client.remove_object(st.bucket, obj.object_name)
+            print(f"    - deleted: {obj.object_name}")
+        print("[✓] Bucket contents cleared.")
+    except S3Error as e:
+        print(f"[error] Failed to clear bucket: {e}")
+        raise
+
+
+def reset_ducklake_catalog(con: duckdb.DuckDBPyConnection, cfg: AppConfig) -> None:
+    """
+    Drop all tables in the DuckLake catalog.
+    This is useful when reusing an existing catalog but wanting fresh data.
+    """
+    alias = cfg.catalog.alias
+    
+    # Get list of tables in the catalog
+    try:
+        tables = con.execute(f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{alias}'").fetchall()
+        if not tables:
+            print("[skip] No tables found in DuckLake catalog.")
+            return
+        
+        print(f"[+] Dropping {len(tables)} tables from DuckLake catalog '{alias}'...")
+        for (table_name,) in tables:
+            con.execute(f"DROP TABLE IF EXISTS {alias}.{table_name};")
+            print(f"    - dropped: {table_name}")
+        print("[✓] DuckLake catalog tables cleared.")
+    except Exception as e:
+        print(f"[warning] Could not drop tables: {e}")
+
+
+def ensure_minio_secret(con: duckdb.DuckDBPyConnection, storage: StorageMinIO, secret_name: str = "minio") -> None:
+    sql = storage.create_secret_sql(secret_name)
+    con.execute(sql)
+
+
+def attach_ducklake(con: duckdb.DuckDBPyConnection, cfg: AppConfig) -> None:
+    # Make sure the metadata dir exists on disk for the DuckDB file path
+    md_dir = os.path.dirname(os.path.abspath(cfg.metadata.file_path)) or "."
+    os.makedirs(md_dir, exist_ok=True)
+
+    # Configure S3/MinIO access
+    ensure_minio_secret(con, cfg.storage)
+
+    # ATTACH ducklake
+    data_path = cfg.storage.data_path()
+    attach_sql = cfg.metadata.attach_sql(alias=cfg.catalog.alias, data_path=data_path)
+    con.execute(attach_sql)
+    # Use the attached catalog
+    con.execute(f"USE {cfg.catalog.alias};")
+
+
+
+def generate_tpch_and_load(con, scale: int, ducklake_alias: str, local_db: str = None):
+    """
+    Generates TPC-H data using DuckDB's TPC-H extension and loads it into DuckLake.
+    
+    Args:
+        con: DuckDB connection to the DuckLake catalog
+        scale: TPC-H scale factor
+        ducklake_alias: Alias of the attached DuckLake catalog
+        local_db: Full path for the local DuckDB database file (default: tpch-sf{scale}.duckdb)
+    """
+    # Determine local database file name
+    if local_db is None:
+        local_db = f"tpch-sf{scale}.duckdb"
+
+    # Generate TPC-H data if database doesn't exist
+    if not os.path.exists(local_db):
+        print(f"[+] Creating TPC-H database: {local_db}")
+        print(f"[+] Generating TPC-H scale factor {scale} data using dbgen...")
+        
+        # Create a separate connection for generating TPC-H data
+        tpch_con = duckdb.connect(database=local_db)
+        
+        # Install and load TPC-H extension
+        tpch_con.execute("INSTALL tpch; LOAD tpch;")
+        
+        # Generate TPC-H data with specified scale factor
+        tpch_con.execute(f"CALL dbgen(sf = {scale});")
+        
+        tpch_con.close()
+        print(f"[✓] TPC-H data generation complete: {local_db}")
+    else:
+        print(f"[skip] Using cached dataset: {local_db}")
+
+    # Attach DuckLake and TPC-H databases
+    print(f"[+] Attaching TPC-H database...")
+    con.execute(f"ATTACH '{local_db}' AS tpch_src;")
+
+    # Copy all tables into DuckLake
+    print(f"[+] Copying tables from TPC-H dataset into DuckLake catalog...")
+    con.execute(f"COPY FROM DATABASE tpch_src TO {ducklake_alias};")
+
+    # Clean up
+    con.execute("DETACH DATABASE tpch_src;")
+    print("[✓] TPC-H dataset successfully loaded into DuckLake.")
+
+
+# --------------------------
+# CLI
+# --------------------------
+
+def load_config(path: str) -> AppConfig:
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+    return AppConfig.from_dict(data)
+
+
+def cmd_attach(args):
+    cfg = load_config(args.config)
+    con = open_duckdb_for_session(cfg)
+    attach_ducklake(con, cfg)
+    # Show summary
+    data_path = cfg.storage.data_path()
+    print(f"Attached DuckLake catalog '{cfg.catalog.alias}'")
+    print(f"  metadata: {cfg.metadata.file_path}")
+    print(f"  data_path: {data_path}")
+    # Confirm we can create a tiny table
+    con.execute("CREATE TABLE IF NOT EXISTS bootstrap_check(x INTEGER);")
+    print("Sanity: created table 'bootstrap_check' in DuckLake catalog")
+
+
+def cmd_load_tpch(args):
+    cfg = load_config(args.config)
+    
+    # Handle reset option
+    if args.reset:
+        print("[!] Reset mode enabled - clearing existing data...")
+        reset_bucket_contents(cfg)
+        reset_metadata_file(cfg)
+        print("[✓] Reset complete.\n")
+    
+    con = open_duckdb_for_session(cfg)
+    attach_ducklake(con, cfg)
+    scale = args.scale or cfg.tpch.default_scale
+    local_db = args.local_db if hasattr(args, 'local_db') else None
+    generate_tpch_and_load(con, scale, cfg.catalog.alias, local_db)
+    # Count a couple of tables
+    for t in ["region", "nation", "customer", "orders", "lineitem"]:
+        try:
+            cnt = con.execute(f"SELECT COUNT(*) FROM {t};").fetchone()[0]
+            print(f"{t:>9}: {cnt:,}")
+        except Exception as e:
+            print(f"{t:>9}: (not found)")
+    print("Done.")
+
+
+def cmd_init_config(args):
+    target = args.path or "config.yaml"
+    if os.path.exists(target) and not args.force:
+        print(f"{target} already exists (use --force to overwrite)", file=sys.stderr)
+        return        
+    with open(target, "w") as f:
+        f.write("""metadata:\n  duckdb_file: "./metadata.ducklake"\n\nstorage:\n  type: "minio"\n  bucket: "dlsandbox"\n  prefix: "tpch/"\n  endpoint: "http://localhost:9000"\n  region: "eu-central-1"\n  use_ssl: false\n  url_style: "path"\n\ncatalog:\n  alias: "dlsandbox"\n\ntpch:\n  default_scale: 1\n""")
+    print(f"Wrote {target}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DuckLake bootstrap CLI (DuckDB metadata + MinIO data)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_attach = sub.add_parser("attach", help="Attach DuckLake catalog and set up secrets")
+    p_attach.add_argument("--config", default="config.yaml", help="Path to config file")
+    p_attach.set_defaults(func=cmd_attach)
+
+    p_tpch = sub.add_parser("load-tpch", help="Generate TPC-H data using DuckDB 'tpch' and load into DuckLake")
+    p_tpch.add_argument("--config", default="config.yaml", help="Path to config file")
+    p_tpch.add_argument("--scale", type=int, help="TPC-H scale factor (overrides config)")
+    p_tpch.add_argument("--local-db", type=str, help="Full path for local DuckDB database file (default: tpch-sf{scale}.duckdb)")
+    p_tpch.add_argument("--reset", action="store_true", help="Reset catalog: delete metadata file and clear bucket contents before loading")
+    p_tpch.set_defaults(func=cmd_load_tpch)
+
+    p_init = sub.add_parser("init-config", help="Write a starter config.yaml")
+    p_init.add_argument("--path", help="Target path (default: ./config.yaml)")
+    p_init.add_argument("--force", action="store_true", help="Overwrite if exists")
+    p_init.set_defaults(func=cmd_init_config)
+
+    p_bucket = sub.add_parser("ensure-bucket", help="Create bucket in MinIO if missing")
+    p_bucket.add_argument("--config", default="config.yaml", help="Path to config file")
+
+    def cmd_ensure_bucket(args):
+        cfg = load_config(args.config)
+        st = cfg.storage
+        from minio import Minio
+        from minio.error import S3Error
+
+        client = Minio(
+            st.endpoint.replace("http://", "").replace("https://", ""),
+            access_key=st.access_key or os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+            secret_key=st.secret_key or os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+            secure=st.use_ssl,
+        )
+        try:
+            if not client.bucket_exists(st.bucket):
+                client.make_bucket(st.bucket)
+                print(f"[ok] created bucket '{st.bucket}' on {st.endpoint}")
+            else:
+                print(f"[skip] bucket '{st.bucket}' already exists")
+        except S3Error as e:
+            print(f"[error] failed to ensure bucket: {e}")
+            sys.exit(1)
+
+    p_bucket.set_defaults(func=cmd_ensure_bucket)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
