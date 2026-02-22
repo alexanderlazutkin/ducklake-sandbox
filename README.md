@@ -33,6 +33,7 @@
   ```
 
 ## Быстрый старт
+Настройка конфигурации см. п.2 раздела "Ручной запуск"
 
 ### Автоматический запуск
 
@@ -52,14 +53,14 @@
 docker compose -f docker-compose.minio.yml up -d
 # Консоль MinIO: http://localhost:9001
 # S3 endpoint: http://localhost:9000
-# Учётные данные по умолчанию: minioadmin / minioadmin
+# Учётные данные по умолчанию: minioadmin / miniopass
 ```
 
 2. **Создание конфигурации**
 
 ```bash
 cp config.example.yaml config.yaml
-# Отредактируйте config.yaml при необходимости
+# Отредактируйте config.yaml 
 ```
 
 3. **Создание бакета и загрузка данных**
@@ -91,7 +92,7 @@ storage:
   use_ssl: false
   url_style: "path"
   access_key: "minioadmin"      # или через env MINIO_ACCESS_KEY
-  secret_key: "minioadmin"      # или через env MINIO_SECRET_KEY
+  secret_key: "minioapass"      # или через env MINIO_SECRET_KEY
 
 catalog:
   alias: "dlsandbox"
@@ -141,7 +142,7 @@ OPTIONS:
   --config PATH       Путь к файлу конфигурации (по умолчанию: config.yaml)
   --scale INT         Scale factor TPC-H (переопределяет config)
   --local-db PATH     Путь к локальному файлу DuckDB (по умолчанию: tpch-sf{scale}.duckdb)
-  --reset             Пересоздать каталог: удалить метаданные и очистить бакет
+  --reset             Пересоздать каталог Ducklake и очистить бакет
 
 ПРИМЕРЫ:
   # Загрузка с scale factor 1
@@ -167,7 +168,7 @@ python run_tpch_queries.py [OPTIONS]
 
 OPTIONS:
   --config PATH       Путь к файлу конфигурации (по умолчанию: config.yaml)
-  --scale INT         Scale factor TPC-H
+  --scale INT         Scale factor TPC-H (1, 10, 30, 100)
   --queries LIST      Список запросов через запятую (например: "1,3,5")
   --output DIR        Директория для результатов (по умолчанию: tpch_validation)
   --no-save-queries   Не сохранять SQL-запросы в файл
@@ -292,6 +293,54 @@ python bootstrap_ducklake.py load-tpch --scale 10 --local-db tpch-sf10.duckdb
 │  └─────────────────┘            └─────────────────┘          │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Пример вывода результатов бенчмарка
+~/ducklake-sandbox$ ./run_tpch_queries.py --benchmark --iterations 5
+Running TPC-H benchmark (scale=10, iterations=5) on DuckLake...
+======================================================================
+[Q01] Running 5 iteration(s)...
+    Attempt 1/5: 2352.20 ms
+    Attempt 2/5: 1071.32 ms
+    Attempt 3/5: 1181.79 ms
+    Attempt 4/5: 1153.49 ms
+...............
+
+======================================================================
+BENCHMARK SUMMARY
+======================================================================
+Query    Avg (ms)     Min (ms)     Max (ms)     Rows       Status
+----------------------------------------------------------------------
+Q01      1405.30      1071.32      2352.20      4          success
+Q02      359.67       279.11       507.49       100        success
+Q03      1175.69      816.59       1687.82      10         success
+Q04      924.37       696.97       1482.69      5          success
+Q05      1040.48      907.56       1503.56      5          success
+Q06      315.22       299.66       334.63       1          success
+Q07      894.81       854.67       1020.28      4          success
+Q08      1440.61      1257.04      1720.00      2          success
+Q09      2290.88      2136.13      2569.54      175        success
+Q10      961.22       857.98       1232.11      20         success
+Q11      199.86       183.40       224.70       0          success
+Q12      651.12       567.00       918.34       2          success
+Q13      1673.40      1442.66      1900.08      45         success
+Q14      608.84       586.88       649.55       1          success
+Q15      590.21       562.71       654.58       1          success
+Q16      319.93       299.71       355.63       27840      success
+Q17      937.04       843.06       1114.55      1          success
+Q18      1551.09      1444.17      1638.34      100        success
+Q19      1079.54      911.08       1479.95      1          success
+Q20      964.13       762.82       1142.13      1804       success
+Q21      3077.54      2613.00      3987.58      100        success
+Q22      343.62       332.13       371.99       7          success
+----------------------------------------------------------------------
+Total benchmark time: 114662.55 ms (114.66 seconds)
+======================================================================
+
+Results saved to tpch_validation/
+  - benchmark_detailed_timing.csv (each attempt)
+  - benchmark_summary.csv (aggregated per query)
+  - tpch_all_queries.sql (all queries)
+
 
 ## Лицензия
 
