@@ -3,4 +3,5 @@ config.yaml
 *.duckdb
 minio-data
 tpch_validation
+tpch_benchmark
 venv
