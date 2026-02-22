@@ -295,6 +295,7 @@ python bootstrap_ducklake.py load-tpch --scale 10 --local-db tpch-sf10.duckdb
 ```
 
 ## Пример вывода результатов бенчмарка
+```
 ~/ducklake-sandbox$ ./run_tpch_queries.py --benchmark --iterations 5
 Running TPC-H benchmark (scale=10, iterations=5) on DuckLake...
 ======================================================================
@@ -340,7 +341,7 @@ Results saved to tpch_validation/
   - benchmark_detailed_timing.csv (each attempt)
   - benchmark_summary.csv (aggregated per query)
   - tpch_all_queries.sql (all queries)
-
+```
 
 ## Лицензия
 
