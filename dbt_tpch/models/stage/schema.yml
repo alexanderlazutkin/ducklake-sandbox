@@ -1,0 +1,33 @@
+version: 2
+
+sources:
+  - name: main
+    description: "Raw data provided by tpc-h data"
+    tables:
+      - name: "customer"
+        description: "Customer data description"
+      - name: "nation"
+        description: "Nation data description"
+
+models:
+  - name: "stage_customer"
+    description: "Staging model for customer data"
+    columns:
+      - name: "customer_id"
+        description: "Unique identifier for each customer"
+      - name: "customer_name"
+        description: "Name of the customer"
+      - name: "market_segment"
+        description: "Market segment of the customer"
+      - name: "nation_id"
+        description: "Foreign key to the nation table"
+
+  - name: "stage_nation"
+    description: "Staging model for nation data"
+    columns:
+      - name: "nation_id"
+        description: "Unique identifier for each nation"
+      - name: "nation_name"
+        description: "Name of the nation"
+      - name: "region_id"
+        description: "Foreign key to the region table"
