@@ -1,0 +1,8 @@
+[project]
+name = "dbt-tpch"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "dbt-core==1.10.11",
+    "dbt-duckdb==1.10.1",
+]
